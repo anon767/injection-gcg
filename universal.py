@@ -12,10 +12,11 @@ from gcg import allowed_tokens, roundtrip_ok, suffix_str
 def _batch_margin(det, pairs):
     """pairs: list of (pre, suf, tail) id-lists -> margins [B], via embedding lookup (no grad)."""
     E_table = det.embed_matrix().detach()
+    dev = E_table.device
     L = max(len(p) + len(s) + len(t) for p, s, t in pairs)
-    Eb = torch.zeros(len(pairs), L, E_table.size(1)); ab = torch.zeros(len(pairs), L, dtype=torch.long)
+    Eb = torch.zeros(len(pairs), L, E_table.size(1), device=dev); ab = torch.zeros(len(pairs), L, dtype=torch.long, device=dev)
     for b, (p, s, t) in enumerate(pairs):
-        e = E_table[torch.tensor(p + s + t)]
+        e = E_table[torch.tensor(p + s + t, device=dev)]
         Eb[b, :e.size(0)] = e; ab[b, :e.size(0)] = 1
     mk = torch.tensor([det.markers] * len(pairs)) if hasattr(det, "markers") else None
     with torch.no_grad():
@@ -24,12 +25,13 @@ def _batch_margin(det, pairs):
 
 def universal(det, texts, n_suffix=20, steps=200, topk=256, batch=192, seed=0, log=print):
     rng = random.Random(seed)
-    vocab = allowed_tokens(det.tok)
     E_table = det.embed_matrix().detach()
+    dev = E_table.device
+    vocab = allowed_tokens(det.tok).to(dev)
     tids = [det.tok(t.replace(getattr(det.tok, "mask_token", "\0"), " "),
                     add_special_tokens=False)["input_ids"] for t in texts]
     suf = vocab[torch.randint(0, len(vocab), (n_suffix,),
-                              generator=torch.Generator().manual_seed(seed))].tolist()
+                              generator=torch.Generator().manual_seed(seed)).to(dev)].tolist()
 
     def splits(suffix):
         return [det.build(tid, suffix) for tid in tids]
@@ -42,14 +44,14 @@ def universal(det, texts, n_suffix=20, steps=200, topk=256, batch=192, seed=0, l
     for step in range(steps):
         # aggregate gradient over a random mini-batch of the training injections
         mb = rng.sample(range(len(tids)), min(16, len(tids)))
-        grad = torch.zeros(n_suffix, len(vocab))
+        grad = torch.zeros(n_suffix, len(vocab), device=dev)
         for i in mb:
             pre, s, tail = det.build(tids[i], suf)
-            oh = torch.zeros(len(s), E_table.size(0), requires_grad=True)
+            oh = torch.zeros(len(s), E_table.size(0), device=dev, requires_grad=True)
             with torch.no_grad():
                 oh.data[range(len(s)), s] = 1.0
-            e = torch.cat([E_table[torch.tensor(pre)], oh @ E_table, E_table[torch.tensor(tail)]], 0)[None]
-            attn = torch.ones(1, e.size(1), dtype=torch.long)
+            e = torch.cat([E_table[torch.tensor(pre, device=dev)], oh @ E_table, E_table[torch.tensor(tail, device=dev)]], 0)[None]
+            attn = torch.ones(1, e.size(1), dtype=torch.long, device=dev)
             mk = torch.tensor([det.markers]) if hasattr(det, "markers") else None
             det.margin_from_embeds(e, attn, mk)[0].backward()
             grad += oh.grad[:, vocab]
