@@ -113,9 +113,11 @@ def main():
 
     # candidate universe: real text tokens only. Special/<unusedN> slots have junk embeddings
     # (never trained) and their decodes retokenise to literal "<unused63>" strings on the wire —
-    # proposing them wastes the tiny candidate batch.
-    allowed = torch.tensor([i for i in range(V)
-                            if not tok.convert_ids_to_tokens(i).startswith("<")], device=dev)
+    # proposing them wastes the tiny candidate batch. NB: convert_ids_to_tokens returns None for
+    # unmapped ids in this vocab — guard those out.
+    _tokstrs = tok.convert_ids_to_tokens(list(range(V)))
+    allowed = torch.tensor([i for i, t in enumerate(_tokstrs)
+                            if isinstance(t, str) and not t.startswith("<")], device=dev)
     log("candidate vocab:", allowed.numel(), "of", V)
 
     # start the suffix as random REAL tokens
