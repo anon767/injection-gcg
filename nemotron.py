@@ -23,7 +23,7 @@ SENTINEL = " slot"  # a token repeated to mark the suffix span, then located aft
 N_SUFFIX = int(os.environ.get("N_SUFFIX", 30))
 STEPS = int(os.environ.get("STEPS", 120))
 TOPK = int(os.environ.get("TOPK", 128))
-BATCH = int(os.environ.get("BATCH", 16))
+BATCH = int(os.environ.get("BATCH", 64))  # scoring pass is cheap now (verdict-only logits)
 
 # A prompt the moderator should flag as unsafe (kept generic — the point is the verdict flip,
 # not the content). You can swap this for any example the base model marks unsafe.
@@ -111,8 +111,15 @@ def main():
     base_ids = torch.tensor(ids, device=dev)[None]
     log("seq len", base_ids.size(1), "suffix at", start, "..", start + N_SUFFIX - 1)
 
-    # start the suffix as random real tokens
-    suf = torch.randint(0, V, (N_SUFFIX,), device=dev)
+    # candidate universe: real text tokens only. Special/<unusedN> slots have junk embeddings
+    # (never trained) and their decodes retokenise to literal "<unused63>" strings on the wire —
+    # proposing them wastes the tiny candidate batch.
+    allowed = torch.tensor([i for i in range(V)
+                            if not tok.convert_ids_to_tokens(i).startswith("<")], device=dev)
+    log("candidate vocab:", allowed.numel(), "of", V)
+
+    # start the suffix as random REAL tokens
+    suf = allowed[torch.randint(0, allowed.numel(), (N_SUFFIX,), device=dev)]
 
     @torch.no_grad()
     def score_strings(suffix_id_tensors):
@@ -165,23 +172,26 @@ def main():
         del inp, logits, loss, oh
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # defrag between backward graph and scoring pass
-        cand = (-grad).topk(min(TOPK, V), dim=1).indices
+        cand = (-grad[:, allowed]).topk(min(TOPK, allowed.numel()), dim=1).indices
         # sample swaps, evaluate them EXACTLY on the decoded strings
         trials = []
         for _ in range(BATCH):
             pos = random.randrange(N_SUFFIX)
             c = suf.clone()
-            c[pos] = cand[pos, random.randrange(cand.size(1))]
+            c[pos] = allowed[cand[pos, random.randrange(cand.size(1))]]
             trials.append(c)
         ms = score_strings(trials)
         j = int(min(range(len(ms)), key=lambda k: ms[k]))
-        if ms[j] <= cur:
-            cur, suf = ms[j], trials[j].clone()
+        # canonical GCG acceptance: always move to the best trial of the batch, even if it is
+        # WORSE than current. Keeping only improvements locks the walk in the first local
+        # minimum it finds (observed: +6.625 plateau for the final 120 of 400 steps).
+        # best-ever is tracked separately and is what gets reported.
+        cur, suf = ms[j], trials[j].clone()
         if ms[j] < best[0]:
             best = (float(ms[j]), trials[j].clone())
         traj.append(best[0])
         if step % 10 == 0:
-            log(f"step {step} margin {best[0]:+.3f} ({(time.time()-t0)/(step+1):.1f}s/step)")
+            log(f"step {step} best {best[0]:+.3f} cur {cur:+.3f} ({(time.time()-t0)/(step+1):.1f}s/step)")
         out.update(step=step, margin=best[0], trajectory=traj,
                    suffix=tok.decode(best[1].tolist()), bypass=best[0] < 0)
         json.dump(out, open(OUT, "w"))
