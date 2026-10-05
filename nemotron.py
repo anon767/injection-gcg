@@ -119,23 +119,30 @@ def main():
         """String-faithful margins: what the judge scores when the DECODED suffix is pasted into the
         user message and the whole thing is re-tokenised through the chat template (deployed view).
         Id-space forward passes of `base_ids` disagree with this because decode->re-encode is not
-        id-stable; optimising the id-space margin chases suffixes that never exist on the wire."""
+        id-stable; optimising the id-space margin chases suffixes that never exist on the wire.
+
+        Memory: LEFT-pad so every row's verdict token sits at position L-1, and ask for
+        logits_to_keep=1 — materialising full [B, L, V] logits (~2.2GB bf16) OOMs a 16GB card."""
         ids_list = [build_ids(tok, proc, UNSAFE_PROMPT + tok.decode(c.tolist()))
                     for c in suffix_id_tensors]
         L = max(len(x) for x in ids_list)
         B = len(ids_list)
-        ids = torch.zeros(B, L, dtype=torch.long, device=dev)
-        attn = torch.zeros(B, L, dtype=torch.long, device=dev)
         pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-        ids.fill_(pad)
-        last = []
+        ids = torch.full((B, L), pad, dtype=torch.long, device=dev)
+        attn = torch.zeros(B, L, dtype=torch.long, device=dev)
         for b, x in enumerate(ids_list):
-            ids[b, :len(x)] = torch.tensor(x, device=dev)
-            attn[b, :len(x)] = 1
-            last.append(len(x) - 1)
-        logits = model(input_ids=ids, attention_mask=attn).logits
-        rows = logits[torch.arange(B), torch.tensor(last, device=dev)]
-        return (rows[:, unsafe_id] - rows[:, safe_id]).float().tolist()
+            ids[b, L - len(x):] = torch.tensor(x, device=dev)
+            attn[b, L - len(x):] = 1
+        pos_ids = (attn.cumsum(-1) - 1).clamp_(min=0)   # explicit, robust under left padding
+        try:
+            lg = model(input_ids=ids, attention_mask=attn, position_ids=pos_ids,
+                       logits_to_keep=1).logits[:, -1]
+        except TypeError:                                # older transformers: no logits_to_keep
+            lg = model(input_ids=ids, attention_mask=attn, position_ids=pos_ids).logits[:, -1]
+        del ids, attn, pos_ids
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return (lg[:, unsafe_id] - lg[:, safe_id]).float().tolist()
 
     cur = score_strings([suf])[0]
     best = (cur, suf.clone())
@@ -154,7 +161,10 @@ def main():
         logits = model(inputs_embeds=inp).logits[0, -1]
         loss = logits[unsafe_id] - logits[safe_id]
         loss.backward()
-        grad = oh.grad  # [N, V]
+        grad = oh.grad.clone()  # [N, V]
+        del inp, logits, loss, oh
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # defrag between backward graph and scoring pass
         cand = (-grad).topk(min(TOPK, V), dim=1).indices
         # sample swaps, evaluate them EXACTLY on the decoded strings
         trials = []
