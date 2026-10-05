@@ -19,7 +19,7 @@ import torch.nn.functional as F
 OUT = os.environ.get("NEMO_OUT", "/kaggle/working/nemotron_attack.json")
 MODEL = "nvidia/Nemotron-3.5-Content-Safety"
 SENTINEL = " slot"  # a token repeated to mark the suffix span, then located after templating
-N_SUFFIX = int(os.environ.get("N_SUFFIX", 16))
+N_SUFFIX = int(os.environ.get("N_SUFFIX", 30))
 STEPS = int(os.environ.get("STEPS", 120))
 TOPK = int(os.environ.get("TOPK", 128))
 BATCH = int(os.environ.get("BATCH", 16))
@@ -111,23 +111,39 @@ def main():
     log("seq len", base_ids.size(1), "suffix at", start, "..", start + N_SUFFIX - 1)
 
     # start the suffix as random real tokens
-    vocab_ok = torch.arange(V, device=dev)
     suf = torch.randint(0, V, (N_SUFFIX,), device=dev)
 
     @torch.no_grad()
-    def margin_of(sufv):
-        ids2 = base_ids.clone()
-        ids2[0, sufIdx] = sufv
-        logits = model(input_ids=ids2).logits[0, -1]  # verdict position
-        return float(logits[unsafe_id] - logits[safe_id])
+    def score_strings(suffix_id_tensors):
+        """String-faithful margins: what the judge scores when the DECODED suffix is pasted into the
+        user message and the whole thing is re-tokenised through the chat template (deployed view).
+        Id-space forward passes of `base_ids` disagree with this because decode->re-encode is not
+        id-stable; optimising the id-space margin chases suffixes that never exist on the wire."""
+        ids_list = [build_ids(tok, proc, UNSAFE_PROMPT + tok.decode(c.tolist()))
+                    for c in suffix_id_tensors]
+        L = max(len(x) for x in ids_list)
+        B = len(ids_list)
+        ids = torch.zeros(B, L, dtype=torch.long, device=dev)
+        attn = torch.zeros(B, L, dtype=torch.long, device=dev)
+        pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        ids.fill_(pad)
+        last = []
+        for b, x in enumerate(ids_list):
+            ids[b, :len(x)] = torch.tensor(x, device=dev)
+            attn[b, :len(x)] = 1
+            last.append(len(x) - 1)
+        logits = model(input_ids=ids, attention_mask=attn).logits
+        rows = logits[torch.arange(B), torch.tensor(last, device=dev)]
+        return (rows[:, unsafe_id] - rows[:, safe_id]).float().tolist()
 
-    best = (margin_of(suf), suf.clone())
-    out["start_margin"] = best[0]
-    log("start margin (unsafe-safe):", round(best[0], 3))
+    cur = score_strings([suf])[0]
+    best = (cur, suf.clone())
+    out["start_margin"] = cur
+    log("start margin (unsafe-safe):", round(cur, 3))
     traj = []
     t0 = time.time()
     for step in range(STEPS):
-        # gradient w.r.t. the suffix one-hots
+        # gradient w.r.t. the suffix one-hots (id space: proposal heuristic only)
         oh = torch.zeros(N_SUFFIX, V, device=dev, dtype=emb.dtype, requires_grad=True)
         with torch.no_grad():
             oh[torch.arange(N_SUFFIX), suf] = 1.0
@@ -138,20 +154,20 @@ def main():
         loss = logits[unsafe_id] - logits[safe_id]
         loss.backward()
         grad = oh.grad  # [N, V]
-        cand = (-grad).topk(TOPK, dim=1).indices
-        # sample and evaluate real swaps
-        import random
+        cand = (-grad).topk(min(TOPK, V), dim=1).indices
+        # sample swaps, evaluate them EXACTLY on the decoded strings
         trials = []
         for _ in range(BATCH):
             pos = random.randrange(N_SUFFIX)
             c = suf.clone()
-            c[pos] = cand[pos, random.randrange(TOPK)]
+            c[pos] = cand[pos, random.randrange(cand.size(1))]
             trials.append(c)
-        ms = [margin_of(c) for c in trials]
+        ms = score_strings(trials)
         j = int(min(range(len(ms)), key=lambda k: ms[k]))
+        if ms[j] <= cur:
+            cur, suf = ms[j], trials[j].clone()
         if ms[j] < best[0]:
-            best = (ms[j], trials[j].clone())
-        suf = best[1].clone()
+            best = (float(ms[j]), trials[j].clone())
         traj.append(best[0])
         if step % 10 == 0:
             log(f"step {step} margin {best[0]:+.3f} ({(time.time()-t0)/(step+1):.1f}s/step)")
@@ -161,12 +177,14 @@ def main():
         if best[0] < 0:
             log("FLIPPED to safe at step", step)
             break
-    # final string-level check
+    # final string-level check (what the attacker actually sends)
     final = tok.decode(best[1].tolist())
-    log("=== done. margin", round(best[0], 3), "bypass", best[0] < 0)
+    str_margin = score_strings([best[1]])[0]
+    log("=== done. margin", round(str_margin, 3), "bypass", str_margin < 0)
     log("suffix:", repr(final))
     out["final_suffix"] = final
-    out["bypass"] = best[0] < 0
+    out["final_margin"] = float(str_margin)
+    out["bypass"] = str_margin < 0
     json.dump(out, open(OUT, "w"))
 
 

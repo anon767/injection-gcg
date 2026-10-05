@@ -6,12 +6,20 @@ injection so the detector scores it as benign. The point of the exercise is defe
 learned text classifier placed in front of an LLM is not a security boundary, because the attacker who
 has the weights optimises directly against it.
 
-Any detector in detectors.py works: GCG only needs the embedding table and a differentiable forward
-pass to the injection-vs-benign margin. Success is re-checked on the decoded string (re-tokenised from
-scratch), so a reported bypass is exactly the text an attacker would send.
+Any detector in detectors.py works.
+
+Scoring is STRING-faithful by construction: candidate suffixes are decoded, re-tokenised as
+`text + suffix`, and scored exactly like the deployed detector scores them
+(det.margin, no grad). Only the top-k candidate proposal uses id-space gradients (a first-order
+heuristic — it does not need the decode/re-encode round-trip to be lossless). This matters because
+decode->re-encode is NOT id-stable for real BPE/SP tokenisers (e.g. "▁VCP" followed by " Opt"
+re-segments to "▁VC" "P"...); scoring in id space chases suffixes whose margin never exists at
+deploy time.
+
+Success is decided on that string margin (margin < tau), so a reported bypass is exactly the text an
+attacker would send.
 """
 import random
-import time
 
 import torch
 
@@ -60,87 +68,81 @@ def _onehot_embed(det, ids_list, suffix_onehot, E_table):
     return out, attn
 
 
+def _markers(det, b):
+    return torch.tensor([det.markers] * b) if hasattr(det, "markers") else None
+
+
 def attack(det, text, n_suffix=20, steps=250, topk=256, batch=256, tau=0.0, seed=0, log=print,
            early_stop=True):
     """Return dict with the best suffix string and whether it bypasses the detector (margin<tau).
 
     tau is the detector's operating threshold in margin space (logit injection - benign); success
-    means driving the margin below it. `trajectory` is the best margin reached by each step, so a
-    single full-length run (early_stop=False) yields the whole attack-success-vs-budget curve.
+    means driving the margin below it. All margins here (start/best/trajectory/final) are STRING
+    margins — the decoded `text + suffix` re-tokenised and scored exactly as deployed. `trajectory`
+    is the best string margin reached by each step, so a single full-length run (early_stop=False)
+    yields the whole attack-success-vs-budget curve.
     """
     rng = random.Random(seed)
     torch.manual_seed(seed)
     E_table = det.embed_matrix().detach()
     dev = E_table.device
-    vocab = allowed_tokens(det.tok).to(dev)
+    vocab = allowed_tokens(det.tok)
+    if len(vocab) == 0:
+        raise ValueError("allowed_tokens found no word-initial BPE/SP tokens "
+                         f"(tokenizer {type(det.tok).__name__}); attack alphabet would be empty")
+    vocab = vocab.to(dev)
 
     tid = det.tok(text.replace(getattr(det.tok, "mask_token", "\0"), " "),
                   add_special_tokens=False)["input_ids"]
     suf = vocab[torch.randint(0, len(vocab), (n_suffix,), generator=torch.Generator().manual_seed(seed)).to(dev)].tolist()
 
-    def split(suffix):
-        return det.build(tid, suffix)
+    def to_str(suffix):
+        return suffix_str(det.tok, suffix)
 
-    @torch.no_grad()
-    def margin_of(suffix):
-        pre, s, tail = split(suffix)
-        oh = torch.zeros(1, len(s), E_table.size(0), device=dev); oh[0, range(len(s)), s] = 1.0
-        E, attn = _onehot_embed(det, [(pre, s, tail)], oh[0], E_table)
-        return float(det.margin_from_embeds(E, attn, _markers(det, 1)))
+    def score(suffixes):
+        """Deployment-faithful margins of `text + decode(suffix)` for a list of id-suffixes."""
+        return det.margin([text + to_str(c) for c in suffixes]).tolist()
 
-    def _markers(det, b):
-        return torch.tensor([det.markers] * b) if hasattr(det, "markers") else None
-
-    best = (margin_of(suf), list(suf))
-    start = best[0]
+    cur = score([suf])[0]
+    best = (cur, list(suf))
+    start = cur
     trajectory = []
     for step in range(steps):
-        pre, s, tail = split(suf)
+        # top-k candidate tokens per position from id-space one-hot gradients (proposal heuristic)
+        pre, s, tail = det.build(tid, suf)
         oh = torch.zeros(len(s), E_table.size(0), device=dev, requires_grad=True)
         with torch.no_grad():
             oh.data[range(len(s)), s] = 1.0
         E, attn = _onehot_embed(det, [(pre, s, tail)], oh, E_table)
-        _markers(det, 1)
         m = det.margin_from_embeds(E, attn, _markers(det, 1))[0]
         m.backward()
         grad = oh.grad[:, vocab]                       # [n_suffix, |vocab|]: d margin / d token
-        cand_tok = (-grad).topk(topk, dim=1).indices   # tokens that most *decrease* the margin
+        cand_tok = (-grad).topk(min(topk, len(vocab)), dim=1).indices  # most *decrease* the margin
 
-        # sample `batch` single-token swaps, evaluate exactly, keep the best
+        # sample `batch` single-token swaps, evaluate them EXACTLY on the decoded strings
         trials = []
         for _ in range(batch):
             pos = rng.randrange(len(s))
-            newtok = int(vocab[cand_tok[pos, rng.randrange(topk)]])
-            cand = s.copy(); cand[pos] = newtok
+            cand = list(s)
+            cand[pos] = int(vocab[cand_tok[pos, rng.randrange(cand_tok.size(1))]])
             trials.append(cand)
-        # batch-evaluate trials
-        rows = [split(c) for c in trials]
-        ohs = []
-        for (p, sc, t), c in zip(rows, trials):
-            o = torch.zeros(len(sc), E_table.size(0), device=dev); o[range(len(sc)), sc] = 1.0
-            ohs.append((p, sc, t, o))
-        with torch.no_grad():
-            L = max(len(p) + len(sc) + len(t) for p, sc, t, _ in ohs)
-            Eb = torch.zeros(len(ohs), L, E_table.size(1), device=dev); ab = torch.zeros(len(ohs), L, dtype=torch.long, device=dev)
-            for b, (p, sc, t, o) in enumerate(ohs):
-                e = torch.cat([E_table[torch.tensor(p, device=dev)], o @ E_table, E_table[torch.tensor(t, device=dev)]], 0)
-                Eb[b, :e.size(0)] = e; ab[b, :e.size(0)] = 1
-            ms = det.margin_from_embeds(Eb, ab, _markers(det, len(ohs)))
-        j = int(ms.argmin())
-        if float(ms[j]) < best[0]:
-            best = (float(ms[j]), trials[j])
-        # move current suffix toward the best trial of this step (standard GCG greedy update)
-        suf = trials[j] if float(ms[j]) <= margin_of(suf) else suf
+        ms = score(trials)
+        j = min(range(len(trials)), key=lambda k: ms[k])
+        # greedy monotone update: move to the best trial unless it is worse than current
+        if ms[j] <= cur:
+            cur, suf = ms[j], list(trials[j])
+        if ms[j] < best[0]:
+            best = (float(ms[j]), list(trials[j]))
         trajectory.append(best[0])
         if step % 25 == 0:
-            log(f"  step {step:3d} margin {best[0]:+.3f} (start {start:+.3f})  suffix={suffix_str(det.tok, best[1])!r}")
-        if early_stop and best[0] < tau and roundtrip_ok(det.tok, best[1]):
+            log(f"  step {step:3d} margin {best[0]:+.3f} (start {start:+.3f})  suffix={to_str(best[1])!r}")
+        if early_stop and best[0] < tau:
             break
 
-    bs = suffix_str(det.tok, best[1])
-    # final check on the STRING (what an attacker actually sends)
+    bs = to_str(best[1])
+    # best[0] was already computed on exactly this string; re-score as an assertion-grade check
     str_margin = float(det.margin([text + bs])[0])
     return {"text": text, "suffix": bs, "n_suffix": n_suffix, "steps_run": step + 1, "tau": tau,
-            "start_margin": start, "suffix_ids_margin": best[0], "string_margin": str_margin,
+            "start_margin": start, "best_margin": best[0], "string_margin": str_margin,
             "bypass": str_margin < tau, "roundtrip": roundtrip_ok(det.tok, best[1]),
             "trajectory": trajectory}
