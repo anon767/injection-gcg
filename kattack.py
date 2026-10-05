@@ -98,7 +98,7 @@ def main():
         # universal suffix for the two real detectors (never let this abort the saved per-prompt data)
         if name in ("smolaya-guard", "protectai") and len(P["train_inj"]) >= 8:
             try:
-                u = universal.universal(det, P["train_inj"][:20], n_suffix=30, steps=200, batch=192, log=print)
+                u = universal.universal(det, P["train_inj"][:20], n_suffix=30, steps=80, batch=192, log=print)
                 m = det.margin([t + u["suffix"] for t in P["eval_inj"]]).numpy()
                 u.update(eval_bypass=float((m < tau).mean()), eval_bypass_ci=ci((m < tau).tolist()),
                          eval_mean_margin=float(m.mean()), tau=float(tau))

@@ -42,8 +42,11 @@ def load():
     except Exception as e:
         log("processor load failed, using tokenizer only:", e)
         proc = None
+    # Gemma-family models overflow to NaN in float16; bfloat16 is numerically stable (and fine
+    # on a T4, just without native tensor-core speedup).
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, trust_remote_code=True, torch_dtype=torch.float16, device_map="auto"
+        MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto",
+        attn_implementation="eager"
     ).eval()
     model.gradient_checkpointing_enable()
     for p in model.parameters():
